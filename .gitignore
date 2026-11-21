@@ -1,0 +1,26 @@
+# Terraform : cache, state et plans
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Variables :
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+.env
+
+# Clés et certificats
+*.pem
+*.key
+
+# Inventaires Ansible générés
+ansible/inventory*.ini
+
+# Divers
+.DS_Store
+.idea/
+.vscode/
