@@ -1,0 +1,4 @@
+# À copier en terraform.tfvars (non commité)
+environment   = "dev"
+owner         = "matisgagneux"
+instance_type = "t3.micro"
