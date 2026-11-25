@@ -1,0 +1,209 @@
+# =============================================================================
+# ci_oidc_compte_classique.tf.exemple : DOCUMENTAIRE, NON APPLIQUÉ
+# =============================================================================
+# Extension « .exemple » : Terraform ne charge que les fichiers *.tf et
+# *.tf.json. Ce fichier est donc ignoré par init / plan / apply.
+#
+# Pourquoi il n'est pas appliqué : le Learner Lab refuse la création d'un
+# fournisseur OIDC et de rôles IAM. Dans le lab, la CI s'authentifie avec les
+# 3 identifiants de session du référent AWS (AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN) stockés en secrets du dépôt et
+# recopiés à chaque Start Lab (scripts/ci-secrets.sh).
+#
+# Ce que ce fichier montre : sur un compte AWS classique, la CI n'a plus AUCUN
+# secret AWS stocké. À chaque job, GitHub émet un jeton OIDC signé, valable
+# quelques minutes ; AWS STS vérifie sa signature et ses « claims » (dépôt,
+# branche, environnement) puis renvoie des identifiants temporaires du rôle
+# ci-dessous. Rien à voler, rien à faire tourner.
+#
+# Le fichier est identique dans envs/dev et envs/prod : seule var.environment
+# change, comme pour le reste du code.
+#
+# Docs :
+#  - GitHub : https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+#  - AWS    : https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc.html
+#  - Terraform : ressources aws_iam_openid_connect_provider, aws_iam_role
+# =============================================================================
+
+locals {
+  github_repository = "matisgagneux/soutenance-novasphere-infra"
+  state_bucket      = "novasphere-tfstate-${data.aws_caller_identity.current.account_id}"
+
+  # Qui a le droit de prendre le rôle, selon l'environnement (claim « sub ») :
+  #  - dev  : les pull requests (plan) et la branche main (apply au merge) ;
+  #  - prod : uniquement un job qui déclare « environment: prod », donc
+  #           après l'approbation exigée par l'environnement GitHub protégé.
+  ci_allowed_subjects = {
+    dev = [
+      "repo:${local.github_repository}:pull_request",
+      "repo:${local.github_repository}:ref:refs/heads/main",
+    ]
+    prod = [
+      "repo:${local.github_repository}:environment:prod",
+    ]
+  }
+}
+
+data "aws_caller_identity" "current" {}
+
+# -----------------------------------------------------------------------------
+# 1. Fournisseur OIDC de GitHub
+# -----------------------------------------------------------------------------
+# Un seul par compte AWS et par URL : en vrai, il serait créé une fois (dossier
+# bootstrap/) et chaque environnement le lirait avec le data source ci-dessous.
+#
+# resource "aws_iam_openid_connect_provider" "github" {
+#   url            = "https://token.actions.githubusercontent.com"
+#   client_id_list = ["sts.amazonaws.com"]
+#   # thumbprint_list facultatif depuis le provider AWS 5.81 : AWS valide
+#   # lui-même le certificat de GitHub.
+# }
+
+data "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
+}
+
+# -----------------------------------------------------------------------------
+# 2. Politique d'approbation : QUI peut prendre le rôle
+# -----------------------------------------------------------------------------
+data "aws_iam_policy_document" "ci_trust" {
+  statement {
+    sid     = "GitHubActionsOIDC"
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [data.aws_iam_openid_connect_provider.github.arn]
+    }
+
+    # Le jeton doit être destiné à AWS STS…
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # …et venir de NOTRE dépôt, depuis la branche / l'environnement autorisés.
+    # Sans cette condition, n'importe quel dépôt GitHub pourrait prendre le rôle.
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = local.ci_allowed_subjects[var.environment]
+    }
+  }
+}
+
+resource "aws_iam_role" "ci" {
+  name                 = "${var.project}-ci-${var.environment}"
+  description          = "Rôle de la CI GitHub Actions pour ${var.environment} (OIDC)"
+  assume_role_policy   = data.aws_iam_policy_document.ci_trust.json
+  max_session_duration = 3600 # 1 h, largement assez pour un plan ou un apply
+}
+
+# -----------------------------------------------------------------------------
+# 3. Politique de permissions : CE QUE le rôle peut faire (moindre privilège)
+# -----------------------------------------------------------------------------
+data "aws_iam_policy_document" "ci_permissions" {
+  # State : uniquement les objets de SON environnement (state + fichier .tflock)
+  statement {
+    sid       = "StateList"
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::${local.state_bucket}"]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${var.project}/${var.environment}/*"]
+    }
+  }
+
+  statement {
+    sid       = "StateReadWrite"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["arn:aws:s3:::${local.state_bucket}/${var.project}/${var.environment}/*"]
+  }
+
+  # Ressources de la pile web, limitées à la région du projet
+  statement {
+    sid       = "WebStack"
+    actions   = ["ec2:*", "elasticloadbalancing:*", "autoscaling:*"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.aws_region]
+    }
+  }
+
+  # Secret : uniquement le chemin SSM de SON environnement.
+  # La CI de dev ne peut ni lire ni écrire /novasphere/prod/…
+  statement {
+    sid = "SsmOwnPath"
+    actions = [
+      "ssm:PutParameter",
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:DeleteParameter",
+      "ssm:AddTagsToResource",
+      "ssm:ListTagsForResource",
+    ]
+    resources = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project}/${var.environment}/*"]
+  }
+
+  statement {
+    sid       = "SsmDescribe"
+    actions   = ["ssm:DescribeParameters"]
+    resources = ["*"] # cette action n'accepte pas de restriction par ressource
+  }
+
+  # Le Launch Template attache un profil IAM aux instances : la CI doit avoir
+  # le droit de « passer » ce rôle, et seulement celui-là. Dans le lab c'est
+  # LabInstanceProfile ; sur un compte classique, le rôle dédié décrit dans
+  # SECURITE.md (${var.project}-web-${var.environment}).
+  statement {
+    sid     = "PassInstanceRole"
+    actions = ["iam:PassRole", "iam:GetRole", "iam:GetInstanceProfile"]
+    resources = [
+      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.project}-web-${var.environment}",
+      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:instance-profile/${var.project}-web-${var.environment}",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "ci" {
+  name   = "${var.project}-ci-${var.environment}"
+  role   = aws_iam_role.ci.id
+  policy = data.aws_iam_policy_document.ci_permissions.json
+}
+
+output "ci_role_arn" {
+  description = "À mettre dans la variable de dépôt AWS_ROLE_ARN_<ENV> (pas un secret)"
+  value       = aws_iam_role.ci.arn
+}
+
+# -----------------------------------------------------------------------------
+# 4. Côté GitHub Actions (extrait de workflow, pour comparaison)
+# -----------------------------------------------------------------------------
+# permissions:
+#   id-token: write   # autorise le job à demander un jeton OIDC à GitHub
+#   contents: read
+#
+# steps:
+#   - uses: aws-actions/configure-aws-credentials@v4
+#     with:
+#       role-to-assume: ${{ vars.AWS_ROLE_ARN_DEV }}
+#       aws-region: us-east-1
+#
+# Dans le lab, à la place, le même step reçoit :
+#       aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+#       aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#       aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+#
+# Lab (identifiants de session)         | Compte classique (OIDC)
+# ------------------------------------- | -------------------------------------
+# 3 secrets stockés dans GitHub          | aucun secret stocké
+# valables 4 h, recopiés à chaque lab    | jeton émis à chaque job, ~1 h
+# droits complets du compte du lab       | droits limités au rôle ci-dessus
+# tout job du dépôt peut les utiliser    | seuls dépôt + branche/env autorisés
+# fuite = accès au compte jusqu'à expir. | rien de réutilisable à voler
+# =============================================================================
